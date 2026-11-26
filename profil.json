@@ -1,0 +1,91 @@
+// Auftragssuche der KI-Agenten-Zentrale. Läuft per GitHub Actions (Node 20+), ohne Zusatzpakete.
+// Quellen: offene Schnittstellen von Jobicy und Remote OK. Keine Anmeldung, kein Scraping von Plattformen.
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+
+const cfg = JSON.parse(readFileSync("config/profil.json", "utf8"));
+mkdirSync("data", { recursive: true });
+const FILE = "data/jobs.json";
+const old = existsSync(FILE) ? JSON.parse(readFileSync(FILE, "utf8")) : { jobs: [] };
+const known = new Set(old.jobs.map((j) => j.id));
+const status = { lauf: new Date().toISOString(), quellen: {} };
+const HEAD = { "User-Agent": "kaz-auftragssuche (persoenliches Projekt, wenige Abrufe pro Tag)" };
+const strip = (h) => String(h || "").replace(/<[^>]*>/g, " ").replace(/&[a-z#0-9]+;/gi, " ").replace(/\s+/g, " ").trim();
+const get = async (u) => {
+  const r = await fetch(u, { headers: HEAD });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+};
+
+const QUELLEN = {
+  async Jobicy() {
+    const d = await get("https://jobicy.com/api/v2/remote-jobs?count=50");
+    return (d.jobs || []).map((j) => ({
+      id: "jobicy:" + j.id, quelle: "Jobicy", titel: j.jobTitle || j.title, firma: j.companyName || j.company,
+      text: strip(j.jobExcerpt || j.jobDescription || j.excerpt), ort: String(j.jobGeo || j.location || ""), url: j.url, datum: j.pubDate,
+    }));
+  },
+  async "Remote OK"() {
+    const d = await get("https://remoteok.com/api");
+    return d.filter((j) => j && j.id && j.position).map((j) => ({
+      id: "remoteok:" + j.id, quelle: "Remote OK", titel: j.position, firma: j.company,
+      text: strip(j.description).slice(0, 1500), ort: String(j.location || ""), url: j.url, datum: j.date,
+    }));
+  },
+};
+
+const KW = cfg.keywords.map((k) => k.toLowerCase());
+const BAD = /whatsapp|telegram|western union|gift card|bitcoin|crypto|investment|training fee|wire transfer|money mule|pay (a )?(fee|deposit)/i;
+const GEO = /anywhere|worldwide|europe|germany|deutschland|emea|\beu\b|^$/i;
+const rate = (j) => {
+  const t = j.titel.toLowerCase(), x = (j.text || "").toLowerCase();
+  const th = KW.filter((k) => t.includes(k)).length, xh = KW.filter((k) => x.includes(k)).length;
+  return { treffer: th + xh, score: Math.min(60, th * 30) + Math.min(25, xh * 5) + 15 };
+};
+
+const neu = [];
+for (const [name, fn] of Object.entries(QUELLEN)) {
+  try {
+    const L = await fn();
+    let n = 0;
+    for (const j of L) {
+      if (!j.id || !j.titel || !/^https?:\/\//.test(j.url || "") || known.has(j.id)) continue;
+      const r = rate(j);
+      if (!r.treffer || !GEO.test(j.ort) || BAD.test(j.titel + " " + j.text)) continue;
+      neu.push({ ...j, text: (j.text || "").slice(0, 600), score: r.score, gefunden: status.lauf });
+      n++;
+    }
+    status.quellen[name] = { ok: true, gelesen: L.length, neu: n };
+  } catch (e) {
+    status.quellen[name] = { ok: false, fehler: String(e.message || e) };
+  }
+}
+
+// Entwürfe für die besten Treffer, nur wenn Worker-Zugang als GitHub-Secret hinterlegt ist.
+neu.sort((a, b) => b.score - a.score);
+if (process.env.WORKER_URL && process.env.ACCESS_KEY) {
+  let n = 0;
+  for (const j of neu) {
+    if (n >= cfg.maxEntwuerfe || j.score < cfg.minScore) break;
+    try {
+      const r = await fetch(process.env.WORKER_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-access-key": process.env.ACCESS_KEY },
+        body: JSON.stringify({ task: "angebot", job: { titel: j.titel, firma: j.firma, text: j.text, quelle: j.quelle }, profil: cfg.profil }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || "HTTP " + r.status);
+      j.entwurf = d.reply;
+      n++;
+    } catch (e) {
+      status.entwurfFehler = String(e.message || e);
+      break;
+    }
+  }
+  status.entwuerfe = n;
+}
+
+const grenze = Date.now() - 30 * 864e5;
+const jobs = [...neu, ...old.jobs].filter((j) => Date.parse(j.gefunden) > grenze).slice(0, 300);
+writeFileSync(FILE, JSON.stringify({ aktualisiert: status.lauf, jobs }, null, 1));
+writeFileSync("data/status.json", JSON.stringify(status, null, 1));
+console.log(JSON.stringify(status));
